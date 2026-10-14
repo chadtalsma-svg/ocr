@@ -1,8 +1,9 @@
 /**
  * @happyvertical/ocr - Unlimited-OCR provider for served GPU inference
  *
- * This provider talks to a running baidu/Unlimited-OCR SGLang server using its
- * OpenAI-compatible chat completions endpoint. The endpoint can be reached
+ * This provider talks to a running baidu/Unlimited-OCR server using its
+ * OpenAI-compatible chat completions endpoint. The server can be SGLang or
+ * vLLM (see {@link UnlimitedOCRBackend}); the endpoint can be reached
  * directly, or through Bifrost when Bifrost is configured to route the model.
  */
 
@@ -21,16 +22,31 @@ import { OCRProcessingError } from '../shared/types';
 /**
  * Transport used by the Unlimited-OCR provider.
  *
- * - `direct` sends requests to a served SGLang endpoint.
+ * - `direct` sends requests to a served SGLang or vLLM endpoint.
  * - `bifrost` sends requests through a Bifrost-compatible gateway.
  */
 export type UnlimitedOCRTransport = 'direct' | 'bifrost';
 
 /**
+ * Inference server that serves Unlimited-OCR, which decides the request shape.
+ *
+ * - `sglang` (default) sends SGLang fields: `custom_params` for the n-gram
+ *   window, `images_config.image_mode`, and an optional
+ *   `custom_logit_processor`.
+ * - `vllm` follows the vLLM recipe (https://recipes.vllm.ai/baidu/Unlimited-OCR):
+ *   it sends `vllm_xargs: { ngram_size, window_size }` for the server-side
+ *   `NGramPerReqLogitsProcessor`, starts the prompt with one literal `<image>`
+ *   placeholder per image sent (vLLM rejects a request whose placeholder
+ *   count differs from its image count), and omits the SGLang-only `images_config` and `custom_logit_processor`
+ *   fields (vLLM chooses the image mode itself).
+ */
+export type UnlimitedOCRBackend = 'sglang' | 'vllm';
+
+/**
  * Image processing mode sent to Unlimited-OCR.
  *
  * `auto` uses `gundam` for single-image requests and `base` for multi-image
- * or multi-page requests.
+ * or multi-page requests. Only the `sglang` backend sends it.
  */
 export type UnlimitedOCRImageMode = 'auto' | 'gundam' | 'base';
 
@@ -38,25 +54,43 @@ export type UnlimitedOCRImageMode = 'auto' | 'gundam' | 'base';
  * Configuration for the served Unlimited-OCR provider.
  */
 export interface UnlimitedOCRProviderConfig {
-  /** Direct SGLang URL or Bifrost gateway URL. */
+  /** Direct SGLang/vLLM URL or Bifrost gateway URL. */
   baseUrl?: string;
   /** Optional API key. Required for HappyVertical Bifrost virtual-key auth. */
   apiKey?: string;
   /** Served model name. The upstream SGLang example uses `Unlimited-OCR`. */
   model?: string;
-  /** Whether the endpoint is direct SGLang or Bifrost-routed. */
+  /** Whether the endpoint is direct or Bifrost-routed. */
   transport?: UnlimitedOCRTransport;
-  /** Image mode sent to Unlimited-OCR. `auto` uses `gundam` for one image and `base` for multi-page. */
+  /**
+   * Inference server behind the endpoint. Defaults to `sglang`; set `vllm`
+   * (or `HAVE_OCR_UNLIMITED_BACKEND=vllm`) for the vLLM recipe.
+   */
+  backend?: UnlimitedOCRBackend;
+  /**
+   * Image mode sent to Unlimited-OCR. `auto` uses `gundam` for one image and
+   * `base` for multi-page. Ignored by the `vllm` backend.
+   */
   imageMode?: UnlimitedOCRImageMode;
-  /** Prompt for a single image. */
+  /**
+   * Prompt for a single image. Defaults to `document parsing.`. See
+   * `multiPagePrompt` for how the `vllm` backend places `<image>` placeholders.
+   */
   prompt?: string;
-  /** Prompt for multiple images/pages. */
+  /**
+   * Prompt for multiple images/pages. Defaults to `Multi page parsing.`.
+   *
+   * The `vllm` backend needs exactly one `<image>` placeholder per image sent.
+   * A prompt that already contains as many placeholders as the request has
+   * images is sent unchanged; otherwise every `<image>` is removed and one
+   * placeholder per image is prefixed (`<image><image>Multi page parsing.`).
+   */
   multiPagePrompt?: string;
-  /** Whether to use SGLang streaming responses. */
+  /** Whether to request streaming (server-sent events) responses. */
   stream?: boolean;
   /** Request timeout in milliseconds. */
   timeout?: number;
-  /** No-repeat ngram size for Unlimited-OCR custom params. */
+  /** No-repeat ngram size (`custom_params` on SGLang, `vllm_xargs` on vLLM). */
   ngramSize?: number;
   /** Override no-repeat ngram window for all requests. */
   ngramWindow?: number;
@@ -65,7 +99,8 @@ export interface UnlimitedOCRProviderConfig {
   /** Window used for multi-image `base` mode when ngramWindow is not set. */
   multiImageNgramWindow?: number;
   /**
-   * SGLang custom logit processor string.
+   * SGLang custom logit processor string. Ignored by the `vllm` backend,
+   * which enables its n-gram logits processor server-side.
    *
    * The upstream Python example uses:
    * `DeepseekOCRNoRepeatNGramLogitProcessor.to_str()`
@@ -80,6 +115,7 @@ interface ResolvedUnlimitedOCRConfig {
   apiKey?: string;
   model: string;
   transport: UnlimitedOCRTransport;
+  backend: UnlimitedOCRBackend;
   imageMode: UnlimitedOCRImageMode;
   prompt: string;
   multiPagePrompt: string;
@@ -121,6 +157,7 @@ interface ChatCompletionResponse {
 
 const ENV_VARS = {
   transport: 'HAVE_OCR_UNLIMITED_TRANSPORT',
+  backend: 'HAVE_OCR_UNLIMITED_BACKEND',
   baseUrl: 'HAVE_OCR_UNLIMITED_BASE_URL',
   apiKey: 'HAVE_OCR_UNLIMITED_API_KEY',
   model: 'HAVE_OCR_UNLIMITED_MODEL',
@@ -149,6 +186,30 @@ function parseTransport(value?: string): UnlimitedOCRTransport | undefined {
     return value;
   }
   return undefined;
+}
+
+function parseBackend(value?: string): UnlimitedOCRBackend | undefined {
+  const normalized = value?.toLowerCase();
+  if (normalized === 'sglang' || normalized === 'vllm') {
+    return normalized;
+  }
+  return undefined;
+}
+
+const VLLM_IMAGE_TOKEN = '<image>';
+
+/**
+ * vLLM's DeepseekOCRProcessor requires the prompt's `<image>` count to equal
+ * the request's image count. Keep a prompt that already matches; otherwise
+ * drop its placeholders and prefix one per image.
+ */
+function withImageTokens(prompt: string, imageCount: number): string {
+  const placeholders = prompt.split(VLLM_IMAGE_TOKEN).length - 1;
+  if (placeholders === imageCount) {
+    return prompt;
+  }
+  const text = prompt.split(VLLM_IMAGE_TOKEN).join('');
+  return `${VLLM_IMAGE_TOKEN.repeat(imageCount)}${text}`;
 }
 
 function parseImageMode(value?: string): UnlimitedOCRImageMode | undefined {
@@ -190,7 +251,7 @@ function normalizeMimeFromFormat(format?: string): string | null {
 }
 
 /**
- * OCR provider for baidu/Unlimited-OCR when served by SGLang.
+ * OCR provider for baidu/Unlimited-OCR when served by SGLang or vLLM.
  */
 export class UnlimitedOCRProvider implements OCRProvider {
   readonly name = 'unlimited-ocr';
@@ -214,8 +275,12 @@ export class UnlimitedOCRProvider implements OCRProvider {
       envTransport ??
       (hasBifrostSignal && !directBaseUrl ? 'bifrost' : 'direct');
 
+    const backend =
+      config.backend ?? parseBackend(env(ENV_VARS.backend)) ?? 'sglang';
+
     this.config = {
       transport,
+      backend,
       baseUrl:
         directBaseUrl ??
         (transport === 'bifrost'
@@ -337,6 +402,7 @@ export class UnlimitedOCRProvider implements OCRProvider {
           provider: this.name,
           model: this.config.model,
           transport: this.config.transport,
+          backend: this.config.backend,
           imageMode: this.resolveImageMode(imageCount),
           outputMode: 'text',
         },
@@ -393,6 +459,7 @@ export class UnlimitedOCRProvider implements OCRProvider {
         baseUrl: this.config.baseUrl,
         apiKey: Boolean(this.config.apiKey),
         model: this.config.model,
+        backend: this.config.backend,
         imageMode: this.config.imageMode,
         stream: this.config.stream,
       },
@@ -409,6 +476,7 @@ export class UnlimitedOCRProvider implements OCRProvider {
       providerSpecific: {
         model: this.config.model,
         transport: this.config.transport,
+        backend: this.config.backend,
         servedEndpoint: true,
         multiImage: true,
         imageMode: this.config.imageMode,
@@ -463,8 +531,12 @@ export class UnlimitedOCRProvider implements OCRProvider {
     const validImages = images
       .map((image) => this.imageToDataUrl(image))
       .filter((dataUrl): dataUrl is string => Boolean(dataUrl));
-    const prompt =
+    const basePrompt =
       validImages.length > 1 ? this.config.multiPagePrompt : this.config.prompt;
+    const prompt =
+      this.config.backend === 'vllm'
+        ? withImageTokens(basePrompt, validImages.length)
+        : basePrompt;
     const languageHint = options?.language
       ? ` Preferred OCR language(s): ${options.language}.`
       : '';
@@ -485,13 +557,12 @@ export class UnlimitedOCRProvider implements OCRProvider {
   }
 
   private buildPayload(contentParts: ContentPart[], imageCount: number) {
-    const imageMode = this.resolveImageMode(imageCount);
     const ngramWindow =
       this.config.ngramWindow ??
       (imageCount > 1
         ? this.config.multiImageNgramWindow
         : this.config.singleImageNgramWindow);
-    const customParams = Object.fromEntries([
+    const ngramParams = Object.fromEntries([
       ['ngram_size', this.config.ngramSize],
       ['window_size', ngramWindow],
     ]);
@@ -499,17 +570,24 @@ export class UnlimitedOCRProvider implements OCRProvider {
       model: this.config.model,
       messages: [{ role: 'user', content: contentParts }],
       temperature: 0,
-      // biome-ignore lint/style/useNamingConvention: SGLang/OpenAI-compatible field
+      // biome-ignore lint/style/useNamingConvention: SGLang/vLLM OpenAI-compatible field
       skip_special_tokens: false,
-      // biome-ignore lint/style/useNamingConvention: SGLang field
-      images_config: { image_mode: imageMode },
-      // biome-ignore lint/style/useNamingConvention: SGLang field
-      custom_params: customParams,
       stream: this.config.stream,
     };
 
-    if (this.config.customLogitProcessor) {
-      payload.custom_logit_processor = this.config.customLogitProcessor;
+    if (this.config.backend === 'vllm') {
+      // vLLM silently drops unknown request fields, so the n-gram processor
+      // args must travel in `vllm_xargs` and SGLang-only fields are omitted.
+      payload.vllm_xargs = ngramParams;
+    } else {
+      payload.images_config = {
+        // biome-ignore lint/style/useNamingConvention: SGLang field
+        image_mode: this.resolveImageMode(imageCount),
+      };
+      payload.custom_params = ngramParams;
+      if (this.config.customLogitProcessor) {
+        payload.custom_logit_processor = this.config.customLogitProcessor;
+      }
     }
 
     return {
@@ -519,6 +597,10 @@ export class UnlimitedOCRProvider implements OCRProvider {
   }
 
   private resolveImageMode(imageCount: number): 'gundam' | 'base' {
+    // vLLM picks the mode server-side: gundam for one image, base for many.
+    if (this.config.backend === 'vllm') {
+      return imageCount > 1 ? 'base' : 'gundam';
+    }
     if (
       this.config.imageMode === 'gundam' ||
       this.config.imageMode === 'base'
