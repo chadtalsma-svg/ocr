@@ -1,5 +1,13 @@
 # @happyvertical/ocr
 
+## 0.61.7
+
+### Patch Changes
+
+- ### Features
+
+  - add Unlimited-OCR vLLM backend speaking the official recipe (#145) (ocr)
+
 ## 0.61.6
 
 ### Patch Changes
